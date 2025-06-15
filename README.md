@@ -1,2 +1,2 @@
 # bannayan
-I am trying gradually to make a generic codes for each learnign algorithm
+I am gradually working on developing generic code templates for each learning algorithm.
