@@ -1,0 +1,6 @@
+Unnamed: 0,name,sex,math_score,bio_score,age,student_job,GP,studytime,new
+0,Alice,F,85,90,16,Part-time,3.8,2 hours,19.8
+1,Bob,M,78,82,17,,3.5,3 hours,20.5
+2,Charlie,M,92,85,16,,3.9,1 hour,19.9
+3,David,M,88,87,18,Part-time,3.7,4 hours,21.7
+4,Eva,F,95,93,17,,4.0,2 hours,21.0
