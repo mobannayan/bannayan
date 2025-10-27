@@ -1,0 +1,193 @@
+import torch
+import torch.nn as nn
+import numpy as np
+
+
+class BaseWheatModel:
+    """Pure process-based wheat growth model"""
+    def __init__(self, Tbase=4.0, Eb=1.85, Eimax=0.94, K=0.7, Lmax=7.0,
+                 T1=900.0, alpha=0.005, beta=0.002, HI=0.45):
+        self.Tbase = Tbase
+        self.Eb = Eb
+        self.Eimax = Eimax
+        self.K = K
+        self.Lmax = Lmax
+        self.T1 = T1
+        self.alpha = alpha
+        self.beta = beta
+        self.HI = HI
+        self.T2 = (1/beta) * np.log(1 + np.exp(alpha * T1))
+
+    def calculate_GDD(self, T, Tbase=None):
+        if Tbase is None:
+            Tbase = self.Tbase
+        return np.maximum(T - Tbase, 0)
+
+    def calculate_LAI(self, GDD_sum):
+        term1 = 1 / (1 + np.exp(-self.alpha * (GDD_sum - self.T1)))
+        term2 = np.exp(self.beta * (GDD_sum - self.T2))
+        lai = self.Lmax * (term1 - term2)
+        return np.maximum(lai, 0)
+
+    def calculate_biomass_increment(self, LAI, PAR):
+        interception = self.Eimax * (1 - np.exp(-self.K * LAI))
+        return self.Eb * interception * PAR
+
+    def simulate(self, T_avg, PAR):
+        n_days = len(T_avg)
+        GDD = np.zeros(n_days)
+        LAI = np.zeros(n_days)
+        biomass = np.zeros(n_days)
+
+        GDD[0] = self.calculate_GDD(T_avg[0])
+        LAI[0] = 0
+        biomass[0] = 0
+
+        for t in range(1, n_days):
+            GDD[t] = self.calculate_GDD(T_avg[t])
+            GDD_cumsum = GDD[:t+1].sum()
+            LAI[t] = self.calculate_LAI(GDD_cumsum)
+            biomass_increment = self.calculate_biomass_increment(LAI[t], PAR[t])
+            biomass[t] = biomass[t-1] + biomass_increment
+
+        grain_yield = biomass[-1] * self.HI
+
+        return {
+            'LAI': LAI,
+            'biomass': biomass,
+            'GDD': GDD,
+            'grain_yield': grain_yield
+        }
+
+
+
+class HybridWheatModel(nn.Module):
+    """
+    Hybrid model: physics provides baseline, NN adds step-by-step corrections
+
+    Physics parameters are frozen (non-learnable) to maintain interpretability.
+    Only the correction network is trained.
+
+    Note: For some applications, you could make physics parameters learnable
+    (using nn.Parameter) to calibrate them with observations while maintaining
+    the physics structure.
+    """
+    def __init__(self, base_model_params=None, hidden_size=32):
+        super().__init__()
+
+        if base_model_params is None:
+            base_model_params = {}
+
+        # Physics parameters (FROZEN - not learnable)
+        # These maintain the base model's physics exactly
+        self.Tbase = base_model_params.get('Tbase', 4.0)
+        self.Eb = base_model_params.get('Eb', 1.85)
+        self.Eimax = base_model_params.get('Eimax', 0.94)
+        self.K = base_model_params.get('K', 0.7)
+        self.Lmax = base_model_params.get('Lmax', 7.0)
+        self.T1 = base_model_params.get('T1', 900.0)
+        self.alpha = base_model_params.get('alpha', 0.005)
+        self.beta = base_model_params.get('beta', 0.002)
+
+        # Correction network
+        # Input: [T, PAR, physics_LAI, physics_biomass_increment]
+        # Output: [LAI_correction, biomass_correction]
+        self.correction_net = nn.Sequential(
+            nn.Linear(4, hidden_size),
+            nn.Tanh(),
+            nn.Linear(hidden_size, hidden_size//2),
+            nn.Tanh(),
+            nn.Linear(hidden_size//2, 2),
+        )
+
+        # Initialize correction network to output near-zero corrections
+        # This ensures untrained hybrid ≈ base model
+        nn.init.xavier_uniform_(self.correction_net[0].weight, gain=0.01)
+        nn.init.zeros_(self.correction_net[0].bias)
+        nn.init.xavier_uniform_(self.correction_net[2].weight, gain=0.01)
+        nn.init.zeros_(self.correction_net[2].bias)
+        nn.init.xavier_uniform_(self.correction_net[4].weight, gain=0.01)
+        nn.init.zeros_(self.correction_net[4].bias)
+
+    def _calculate_LAI_physics(self, GDD_sum):
+        """Physics-based LAI"""
+        T2 = (1/self.beta) * np.log(1 + np.exp(self.alpha * self.T1))
+        term1 = 1 / (1 + torch.exp(-self.alpha * (GDD_sum - self.T1)))
+        term2 = torch.exp(self.beta * (GDD_sum - T2))
+        lai = self.Lmax * (term1 - term2)
+        return torch.clamp(lai, min=0.0)
+
+    def _calculate_biomass_increment_physics(self, LAI, PAR):
+        """Physics-based biomass increment"""
+        interception = self.Eimax * (1 - torch.exp(-self.K * LAI))
+        return self.Eb * interception * PAR
+
+    def step(self, T, PAR, GDD_cumsum, biomass_cumsum):
+        """Single time step with physics + correction"""
+        # Physics predictions
+        delta_GDD = torch.clamp(T - self.Tbase, min=0.0)
+        new_GDD = GDD_cumsum + delta_GDD
+
+        physics_LAI = self._calculate_LAI_physics(new_GDD)
+        physics_biomass_increment = self._calculate_biomass_increment_physics(physics_LAI, PAR)
+
+        # NN correction
+        correction_input = torch.stack([T, PAR, physics_LAI, physics_biomass_increment], dim=-1)
+        corrections = self.correction_net(correction_input)
+
+        # Apply corrections with appropriate scaling
+        # Corrections are small adjustments to physics predictions
+        LAI_correction = torch.tanh(corrections[..., 0]) * 0.5
+        biomass_correction = torch.tanh(corrections[..., 1]) * 10.0
+
+        # Final predictions with corrections
+        final_LAI = torch.clamp(physics_LAI + LAI_correction, min=0.0)
+        final_biomass_increment = torch.clamp(physics_biomass_increment + biomass_correction, min=0.0)
+
+        new_biomass = biomass_cumsum + final_biomass_increment
+
+        return (new_GDD, new_biomass, final_LAI, final_biomass_increment,
+                physics_LAI, physics_biomass_increment)
+
+    def forward(self, T_seq, PAR_seq):
+        """
+        Run full sequence
+        Returns: (final_LAI, final_biomass, physics_LAI, physics_biomass)
+        """
+        if T_seq.dim() == 0:
+            T_seq = T_seq.unsqueeze(0)
+            PAR_seq = PAR_seq.unsqueeze(0)
+
+        seq_length = len(T_seq)
+
+        # Initialize
+        GDD = torch.tensor(0.0, device=T_seq.device)
+        biomass = torch.tensor(0.0, device=T_seq.device)
+
+        # Storage
+        LAI_history = []
+        biomass_history = []
+        physics_LAI_history = []
+        physics_biomass_history = []
+
+        for t in range(seq_length):
+            GDD, biomass, LAI, _, phys_LAI, phys_b_inc = self.step(
+                T_seq[t], PAR_seq[t], GDD, biomass
+            )
+
+            LAI_history.append(LAI)
+            biomass_history.append(biomass)
+            physics_LAI_history.append(phys_LAI)
+
+            # For physics biomass history, accumulate the physics increments separately
+            if t == 0:
+                physics_biomass_history.append(phys_b_inc)
+            else:
+                physics_biomass_history.append(physics_biomass_history[-1] + phys_b_inc)
+
+        final_LAI = torch.stack(LAI_history)
+        final_biomass = torch.stack(biomass_history)
+        physics_LAI = torch.stack(physics_LAI_history)
+        physics_biomass = torch.stack(physics_biomass_history)
+
+        return final_LAI, final_biomass, physics_LAI, physics_biomass
